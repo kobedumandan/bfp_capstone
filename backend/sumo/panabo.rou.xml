@@ -1,0 +1,8 @@
+<routes>
+    <!-- Fire truck vehicle type -->
+    <vType id="firetruckType" accel="2.0" decel="4.5" sigma="0.2"
+           length="7.5" minGap="2.0" maxSpeed="22.0" color="1,0,0"/>
+
+    <!-- Routes and vehicles are generated dynamically via TraCI during simulation.
+         Add static background traffic routes here once the network file is ready. -->
+</routes>
