@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import '../styles/RightSidebar.css'
 
 const TABS = ['Incident', 'Routing', 'Timeline']
 

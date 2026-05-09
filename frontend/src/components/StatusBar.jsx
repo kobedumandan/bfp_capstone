@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import '../styles/StatusBar.css'
 
 export default function StatusBar() {
   const [lastSync, setLastSync] = useState('')

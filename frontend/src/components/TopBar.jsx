@@ -1,9 +1,9 @@
 import { useState, useEffect } from 'react'
+import '../styles/TopBar.css'
 
-const NAV_ITEMS = ['Dashboard', 'Incidents', 'Personnel', 'Stations', 'Reports', 'GNN Model']
+const NAV_ITEMS = ['Dashboard', 'Incidents', 'Personnel', 'Stations', 'Reports']
 
-export default function TopBar() {
-  const [activeNav, setActiveNav] = useState('Dashboard')
+export default function TopBar({ activeNav, onNavChange, theme, onThemeToggle }) {
   const [clock, setClock] = useState('')
 
   useEffect(() => {
@@ -27,7 +27,7 @@ export default function TopBar() {
           <button
             key={item}
             className={`nav-btn${activeNav === item ? ' active' : ''}`}
-            onClick={() => setActiveNav(item)}
+            onClick={() => onNavChange(item)}
           >
             {item}
           </button>
@@ -37,6 +37,9 @@ export default function TopBar() {
       <div className="topbar-right">
         <div className="alert-badge">2 ACTIVE</div>
         <div className="status-dot" />
+        <button className="theme-toggle" onClick={onThemeToggle} title="Toggle theme">
+          {theme === 'dark' ? '☀' : '☾'}
+        </button>
         <div className="system-time">{clock}</div>
         <div className="topbar-divider" />
         <div className="user-chip">

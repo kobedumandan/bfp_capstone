@@ -1,0 +1,30 @@
+.statusbar {
+  height: 28px;
+  background: var(--bg-panel);
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  gap: 20px;
+  flex-shrink: 0;
+}
+
+.status-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+
+.status-item .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+.dot-green { background: var(--accent-green); box-shadow: 0 0 5px var(--accent-green); }
+.dot-fire  { background: var(--accent-fire);  box-shadow: 0 0 5px var(--accent-fire); }
+.dot-blue  { background: var(--accent-blue);  box-shadow: 0 0 5px var(--accent-blue); }
+.dot-amber { background: var(--accent-amber); box-shadow: 0 0 5px var(--accent-amber); }

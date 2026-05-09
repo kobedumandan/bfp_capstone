@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo } from 'react'
-import { MapContainer, TileLayer, Marker, Polyline, GeoJSON, Tooltip, useMap } from 'react-leaflet'
+import '../styles/MapArea.css'
+import { MapContainer, TileLayer, Marker, Polyline, GeoJSON, Tooltip, useMap, useMapEvents } from 'react-leaflet'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { PANABO_BOUNDARY } from '../data/panaboBoundary'
@@ -50,6 +51,49 @@ const ROUTES = [
   { positions: [[7.312, 125.684], [7.330, 125.667]], color: '#1e90ff', cls: 'route-primary' },
   { positions: [[7.292, 125.618], [7.330, 125.667]], color: '#00e676', cls: 'route-secondary' },
 ]
+
+// ── Picking-mode helpers (must be inside MapContainer) ───────────────────────
+function MapClickHandler({ active, onPick }) {
+  useMapEvents({
+    click(e) {
+      if (active) onPick([e.latlng.lat, e.latlng.lng])
+    },
+  })
+  return null
+}
+
+function CursorController({ active }) {
+  const map = useMap()
+  useEffect(() => {
+    map.getContainer().classList.toggle('pick-cursor', active)
+    return () => map.getContainer().classList.remove('pick-cursor')
+  }, [active, map])
+  return null
+}
+
+function reporterIcon() {
+  return L.divIcon({
+    className: '',
+    iconSize: [36, 36],
+    iconAnchor: [18, 18],
+    html: `<div class="reporter-pin">
+             <div class="reporter-pin-ring"></div>
+             <div class="reporter-pin-core">R</div>
+           </div>`,
+  })
+}
+
+function newIncidentIcon() {
+  return L.divIcon({
+    className: '',
+    iconSize: [44, 44],
+    iconAnchor: [22, 22],
+    html: `<div class="new-inc-pin">
+             <div class="new-inc-ring"></div>
+             <div class="new-inc-core">+</div>
+           </div>`,
+  })
+}
 
 // ── Icon factories ────────────────────────────────────────────────────────────
 function fireIcon(severity) {
@@ -182,7 +226,7 @@ function CoverageLayers() {
 }
 
 // ── Main component ────────────────────────────────────────────────────────────
-export default function MapArea() {
+export default function MapArea({ pickingMode = false, onLocationPicked, pickedLocation, newIncidents = [], reporterLocations = [] }) {
   const [activeLayers, setActiveLayers] = useState(
     new Set(['Incidents', 'Personnel', 'Stations', 'Routes'])
   )
@@ -197,6 +241,15 @@ export default function MapArea() {
 
   return (
     <div className="map-area">
+      {/* Picking-mode banner */}
+      {pickingMode && (
+        <div className="map-pick-banner">
+          {pickedLocation
+            ? `📍 ${pickedLocation[0].toFixed(4)}, ${pickedLocation[1].toFixed(4)}  ·  Click elsewhere to reposition`
+            : '🎯 Click on the map to mark the incident location  ·  ESC to cancel'}
+        </div>
+      )}
+
       <MapContainer
         center={PANABO_CENTER}
         zoom={ZOOM}
@@ -211,6 +264,10 @@ export default function MapArea() {
           subdomains="abcd"
           maxZoom={19}
         />
+
+        {/* Picking-mode handlers */}
+        <MapClickHandler active={pickingMode} onPick={onLocationPicked} />
+        <CursorController active={pickingMode} />
 
         {/* Coverage mask + jurisdiction boundary */}
         <CoverageLayers />
@@ -255,6 +312,35 @@ export default function MapArea() {
           PERSONNEL.map(p => (
             <Marker key={p.initials} position={p.pos} icon={personnelIcon(p.initials, p.cssColor, p.shadow)} />
           ))}
+
+        {/* Newly logged incidents */}
+        {newIncidents.map(inc => (
+          <Marker key={inc.id} position={inc.coords} icon={fireIcon('critical')}>
+            <Tooltip direction="top" className="leaflet-dark-tooltip">
+              <div className="tooltip-id">{inc.id} · NEW</div>
+              <div className="tooltip-name">🔥 {inc.locationName}</div>
+              <div className="tooltip-sub">{inc.severity} · {inc.alarm}</div>
+            </Tooltip>
+          </Marker>
+        ))}
+
+        {/* Reporter location markers */}
+        {reporterLocations.map(r => (
+          <Marker key={r.token} position={r.coords} icon={reporterIcon()}>
+            <Tooltip direction="top" className="leaflet-dark-tooltip">
+              <div className="tooltip-id">{r.token}</div>
+              <div className="tooltip-name">📱 Reporter Location</div>
+              <div className="tooltip-sub">
+                {r.coords[0].toFixed(5)}, {r.coords[1].toFixed(5)}
+              </div>
+            </Tooltip>
+          </Marker>
+        ))}
+
+        {/* Picked location preview pin */}
+        {pickedLocation && (
+          <Marker position={pickedLocation} icon={newIncidentIcon()} />
+        )}
       </MapContainer>
 
       {/* Layer toggles */}

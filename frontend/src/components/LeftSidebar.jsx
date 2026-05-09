@@ -1,3 +1,5 @@
+import '../styles/LeftSidebar.css'
+
 const INCIDENTS = [
   {
     id: 'INC-2026-084',
@@ -37,17 +39,30 @@ const PERSONNEL = [
   { initials: 'FT', name: 'F. Torres',    statusClass: 'pa-standby',    dotClass: 'ps-standby',    statusText: 'Standby → Station 1', iot: 'IoT ✓' },
 ]
 
-export default function LeftSidebar({ selectedId, onSelectIncident }) {
+export default function LeftSidebar({ selectedId, onSelectIncident, newIncidents = [], onStartPicking, pickingMode = false, onOpenLocationRequest, reporterCount = 0 }) {
+  const allIncidents = [
+    ...INCIDENTS,
+    ...newIncidents.map(n => ({
+      id:       n.id,
+      severity: n.severity.toLowerCase(),
+      badge:    n.severity,
+      location: n.locationName,
+      time:     n.time,
+      distance: '— km',
+      units:    0,
+    })),
+  ]
+
   return (
     <div className="sidebar-left">
       {/* Incidents */}
       <div className="sidebar-section">
         <div className="section-header">
           <span className="section-title">Active Incidents</span>
-          <span className="section-count">3 TOTAL</span>
+          <span className="section-count">{allIncidents.length} TOTAL</span>
         </div>
         <div className="incident-list">
-          {INCIDENTS.map(inc => (
+          {allIncidents.map(inc => (
             <div
               key={inc.id}
               className={`incident-card ${inc.severity}${selectedId === inc.id ? ' selected' : ''}`}
@@ -97,6 +112,28 @@ export default function LeftSidebar({ selectedId, onSelectIncident }) {
             </div>
           ))}
         </div>
+      </div>
+
+      {/* Log incident toolbar */}
+      <div className="sidebar-log-toolbar">
+        {pickingMode ? (
+          <div className="slt-picking-state">
+            <div className="slt-picking-dot" />
+            <span>Picking location on map…</span>
+          </div>
+        ) : (
+          <button className="slt-log-btn" onClick={onStartPicking}>
+            <span className="slt-plus">+</span>
+            Log New Incident
+          </button>
+        )}
+        <button className="slt-req-btn" onClick={onOpenLocationRequest} disabled={pickingMode}>
+          <span className="slt-req-icon">📡</span>
+          Request Location
+          {reporterCount > 0 && (
+            <span className="slt-reporter-badge">{reporterCount}</span>
+          )}
+        </button>
       </div>
     </div>
   )
