@@ -688,7 +688,7 @@
 .inc-row-addr {
   font-size: 9.8px;
   color: var(--text-secondary);
-  line-height: 0.8;
+  line-height: 1.25;
   /* margin-top: 1px; */
 }
 

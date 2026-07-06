@@ -1,4 +1,5 @@
 import asyncio
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 import hashlib
@@ -21,16 +22,17 @@ import math
 from sqlalchemy import case, func, or_, text
 from sqlalchemy.orm import Session
 
-from database import check_connection, get_db, SessionLocal
+from database import check_connection, get_db, SessionLocal, engine
 from models import (
     Users, Personnel, HeatmapData, Station, ResponseTeam, ResponseTeamMember,
     Shift, FireIncident, DispatchRecord, DispatchTruck, Route, TokenBlacklist,
     CurrentLocation, Truck, LocationLog, RoadObstruction, GnnConstraint,
     BarangayBoundary, Device, IncidentReport, ReportPhoto,
 )
-from ai import GeoAIRoutingEngine, load_qgis_graph, load_roads_gpkg, load_panabo_graph, register_env, Config
-from ai.config import BASE_DIR
+from ai import GeoAIRoutingEngine, Config
 from auto_dispatch import select_best_team
+from routing_setup import build_routing_engine
+import routing_pool
 
 JWT_SECRET      = os.getenv("JWT_SECRET", "change-me")
 JWT_ALGORITHM   = "HS256"
@@ -66,83 +68,107 @@ logger = logging.getLogger(__name__)
 
 routing_engine: GeoAIRoutingEngine = None  # populated in lifespan
 
+# ── Routing process pool ──────────────────────────────────────────────────────
+# CPU-bound route computation (connector builds, full rebuilds) is offloaded to
+# a pool of worker processes so it runs with real parallelism instead of
+# serializing behind this process's GIL. Each worker loads its own graph copy.
+# ROUTING_POOL_SIZE=0 disables the pool (falls back to in-process compute).
+ROUTING_POOL_SIZE    = int(os.getenv("ROUTING_POOL_SIZE", "2"))
+ROUTING_POOL_TIMEOUT = float(os.getenv("ROUTING_POOL_TIMEOUT", "30"))
+_routing_pool: "ProcessPoolExecutor | None" = None
+
+# Postgres advisory-lock key so that, when the API runs with multiple worker
+# processes, exactly ONE worker runs the stale-driver watchdog (otherwise every
+# worker would scan and reroute the same dispatches). The lock is held for the
+# lifetime of the winning worker via a dedicated raw connection.
+_WATCHDOG_LOCK_KEY = 912736
+_watchdog_lock_conn = None
+
+
+def _acquire_watchdog_lock() -> bool:
+    """Try to claim the singleton watchdog role for this worker process."""
+    global _watchdog_lock_conn
+    try:
+        conn = engine.raw_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (_WATCHDOG_LOCK_KEY,))
+        got = bool(cur.fetchone()[0])
+        cur.close()
+        if got:
+            _watchdog_lock_conn = conn  # keep open to hold the session-level lock
+            return True
+        conn.close()
+        return False
+    except Exception as exc:
+        logger.warning("Watchdog lock acquire failed (%s); running watchdog anyway.", exc)
+        return True  # single-worker fallback: don't lose the watchdog on lock error
+
+
+def _release_watchdog_lock() -> None:
+    global _watchdog_lock_conn
+    if _watchdog_lock_conn is not None:
+        try:
+            _watchdog_lock_conn.close()  # closing the session releases the lock
+        except Exception:
+            pass
+        _watchdog_lock_conn = None
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global routing_engine
+    global routing_engine, main_event_loop, _routing_pool
+    main_event_loop = asyncio.get_running_loop()
 
-    roads_gpkg  = BASE_DIR / "data" / "roads_panabo.gpkg"
-    nodes_file  = BASE_DIR / "data" / "panabo_nodes.geojson"
-    edges_file  = BASE_DIR / "data" / "panabo_edges.geojson"
+    # Main-process engine: serves the /api/routing/* endpoints and the
+    # stale-driver watchdog. The per-request deviation routing goes through the
+    # process pool below instead.
+    routing_engine = build_routing_engine(register_gym=True)
+    if routing_engine is not None:
+        logger.info("GeoAI routing engine ready. Graph: %s", routing_engine.graph.summary())
+    else:
+        logger.warning("Routing engine failed to start (non-fatal); routing endpoints unavailable.")
 
-    try:
-        if roads_gpkg.exists():
-            logger.info("Loading road network from roads_panabo.gpkg …")
-            graph = load_roads_gpkg(roads_gpkg)
-        elif nodes_file.exists() and edges_file.exists():
-            logger.info("Loading road network from QGIS GeoJSON exports …")
-            graph = load_qgis_graph(nodes_file, edges_file)
-        else:
-            logger.info("QGIS files not found — downloading from OSM (first run only) …")
-            graph = load_panabo_graph()
-
-        model_path = Config.GRAPHSAGE_MODEL_PATH
-        routing_engine = GeoAIRoutingEngine(
-            gnn_type=Config.GNN_TYPE,
-            use_rl=Config.USE_RL,
-            use_sumo=Config.USE_SUMO,
-            gnn_model_path=str(model_path) if model_path.exists() else None,
-            in_channels=Config.NODE_FEATURE_DIM,
-            hidden_channels=Config.GNN_HIDDEN,
-            out_channels=Config.GNN_OUT,
-            device=Config.DEVICE,
-        )
-        routing_engine.graph = graph
-
-        # Routing weights come from the GAT-predicted constraints (precomputed
-        # routing_multiplier per road segment). Falls back to the legacy
-        # GraphSAGE edge_weights.json only if the predictions are unavailable.
-        constraints_path = Config.PREDICTED_CONSTRAINTS_PATH
-        if constraints_path.exists():
-            with open(constraints_path, encoding="utf-8") as f:
-                predicted = json.load(f)
-            # Multipliers come from the style config keyed by constraint type
-            # (the export carries routing_constraint_type, not a baked-in
-            # routing_multiplier).
-            style = _load_constraint_style()
-            multiplier_by_type = {
-                k: v.get("routing_multiplier", 1.0)
-                for k, v in style.items()
-                if isinstance(v, dict)
-            }
-            routing_engine.apply_predicted_constraints(
-                predicted.get("features", []), multiplier_by_type
+    # Process pool for CPU-bound route computation (see _run_routing_via_pool).
+    if ROUTING_POOL_SIZE > 0:
+        try:
+            _routing_pool = ProcessPoolExecutor(
+                max_workers=ROUTING_POOL_SIZE, initializer=routing_pool.init_worker
             )
-            logger.info("GAT predicted constraints loaded from %s", constraints_path)
-        else:
-            edge_weights_path = Config.EDGE_WEIGHTS_PATH
-            if edge_weights_path.exists():
-                with open(edge_weights_path) as f:
-                    edge_weights = json.load(f)
-                routing_engine.apply_edge_weights(edge_weights)
-                logger.info("GraphSAGE edge weights loaded from %s", edge_weights_path)
+            # Warm the pool so all workers load their graph now, not on the
+            # first deviation request (avoids cold-start latency spikes).
+            warm_futs = [
+                _routing_pool.submit(routing_pool.warmup, 0.3)
+                for _ in range(ROUTING_POOL_SIZE * 2)
+            ]
+            ready = sum(1 for f in warm_futs if f.result(timeout=180))
+            logger.info(
+                "Routing process pool started and warmed (workers=%s, ready=%s).",
+                ROUTING_POOL_SIZE, ready,
+            )
+        except Exception as exc:
+            logger.warning("Routing pool failed to start (%s); using in-process fallback.", exc)
+            _routing_pool = None
 
-        register_env()
-        logger.info("GeoAI routing engine ready. Graph: %s", graph.summary())
-    except Exception as exc:
-        logger.warning("Routing engine failed to start (non-fatal): %s", exc)
-        logger.warning("Routing endpoints will be unavailable until graph data is loaded.")
-
-    watchdog_task = asyncio.create_task(_stale_driver_watchdog())
-    logger.info("Stale-driver watchdog started (interval=%ss).", WATCHDOG_INTERVAL_SECONDS)
+    watchdog_task = None
+    if _acquire_watchdog_lock():
+        watchdog_task = asyncio.create_task(_stale_driver_watchdog())
+        logger.info("Stale-driver watchdog started (interval=%ss).", WATCHDOG_INTERVAL_SECONDS)
+    else:
+        logger.info("Stale-driver watchdog held by another worker — not started here.")
 
     yield  # server runs here
 
-    watchdog_task.cancel()
-    try:
-        await watchdog_task
-    except asyncio.CancelledError:
-        pass
+    if watchdog_task is not None:
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
+        except asyncio.CancelledError:
+            pass
+    _release_watchdog_lock()
+
+    if _routing_pool is not None:
+        _routing_pool.shutdown(wait=False, cancel_futures=True)
+        logger.info("Routing process pool shut down.")
 
     if routing_engine:
         routing_engine.shutdown()
@@ -2774,6 +2800,27 @@ def _rebuild_routes(
         )
         return None
 
+    return _persist_rebuilt_routes(
+        db, dispatch, route_results, origin_lat, origin_lng, origin_source
+    )
+
+
+def _persist_rebuilt_routes(
+    db: Session,
+    dispatch: DispatchRecord,
+    route_results: list,
+    origin_lat: float,
+    origin_lng: float,
+    origin_source: str,
+):
+    """Replace this dispatch's Route rows with a freshly computed set and point
+    the dispatch at the new selected route. `route_results` is the raw output of
+    the routing compute (in-process or from the pool). Returns (selected, saved)
+    or None. All DB work; safe to call from any process's own session.
+    """
+    if not route_results:
+        return None
+
     # Release the FK on this dispatch, then delete only THIS dispatch's
     # routes (other dispatches on the same fire keep their own route sets).
     dispatch.route_id = None
@@ -2808,6 +2855,35 @@ def _rebuild_routes(
     dispatch.route_id = selected.route_id
     db.commit()
     return selected, saved
+
+
+def _run_routing_via_pool(
+    kind: str, a: float, b: float, c: float, d: float, obstructions: list
+):
+    """Run a CPU-bound routing computation in the process pool so it executes
+    with real parallelism, off this process's GIL. Falls back to the
+    main-process engine if the pool is unavailable or errors.
+
+    `kind` is "routes" (returns route_results list) or "connector" (returns a
+    connector GeoJSON dict). a,b = source lat,lng; c,d = target lat,lng.
+    """
+    pool = _routing_pool
+    if pool is not None:
+        fn = routing_pool.compute_routes if kind == "routes" else routing_pool.compute_connector
+        try:
+            return pool.submit(fn, a, b, c, d, obstructions).result(timeout=ROUTING_POOL_TIMEOUT)
+        except Exception as exc:
+            logger.warning("Pool routing (%s) failed (%s); falling back in-process.", kind, exc)
+
+    if routing_engine is None:
+        return None
+    if kind == "connector":
+        return routing_engine.compute_connector(a, b, c, d, obstructions=obstructions)
+    src = routing_engine.graph.nodes_near(a, b, radius_km=2.0)
+    tgt = routing_engine.graph.nodes_near(c, d, radius_km=2.0)
+    if not src or not tgt:
+        return None
+    return routing_engine.compute_routes_multi_alpha(src[0][0], tgt[0][0], obstructions=obstructions)
 
 
 async def _stale_driver_watchdog():
@@ -2914,16 +2990,117 @@ def _build_rerouted_payload(dispatch: DispatchRecord, selected: Route, saved, or
     }
 
 
+# ── Off-request-thread routing ────────────────────────────────────────────────
+# Operational switch: when true, the deviation-triggered routing runs INLINE in
+# the request (blocking it — the pre-optimisation behaviour, useful for A/B
+# comparison). Default false = deferred to a background task.
+_REROUTE_INLINE = os.getenv("LOCATION_REROUTE_INLINE", "false").lower() == "true"
+
+
+# The event loop of the worker that owns `manager`, captured in lifespan. Sync
+# background tasks (which run in the threadpool) use it to schedule WS broadcasts
+# back onto the loop.
+main_event_loop: "asyncio.AbstractEventLoop | None" = None
+
+
+def _broadcast_threadsafe(payload: dict) -> None:
+    """Schedule an async manager.broadcast() from a synchronous worker thread."""
+    loop = main_event_loop
+    if loop is None:
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(manager.broadcast(payload), loop)
+    except Exception as exc:
+        logger.warning("Thread-safe broadcast failed: %s", exc)
+
+
+def _recompute_deviation_routing_bg(
+    dispatch_id: int, per_id: int, lat: float, lon: float, manning: bool
+) -> None:
+    """Runs AFTER the /api/location/update response is sent (in the threadpool,
+    with its own DB session). Performs the CPU-bound routing a deviation
+    triggers — a full route rebuild if this person mans the truck, otherwise a
+    connector to the fire — so the GNN/graph compute never blocks the
+    location-update request thread. Delivers the result to dashboards via WS.
+    """
+    db = SessionLocal()
+    payload = None
+    try:
+        dispatch = db.get(DispatchRecord, dispatch_id)
+        if dispatch is None or dispatch.dispatch_status not in ("dispatched", "en_route", "on_scene"):
+            return
+        if not dispatch.is_deviated:
+            return  # rejoined the route before this task ran — nothing to do
+
+        obs = _load_active_obstructions(db)
+
+        if manning:
+            incident = dispatch.fire_incident
+            if not incident or incident.fire_latitude is None or incident.fire_longitude is None:
+                return
+            # CPU-bound full route rebuild — run in the process pool (parallel,
+            # off this process's GIL); DB persistence stays here.
+            route_results = _run_routing_via_pool(
+                "routes", lat, lon, incident.fire_latitude, incident.fire_longitude, obs
+            )
+            rebuilt = _persist_rebuilt_routes(
+                db, dispatch, route_results, lat, lon, "driver_location"
+            )
+            if rebuilt is None:
+                return
+            selected, saved = rebuilt
+            dispatch.is_deviated                 = False
+            dispatch.deviation_connector_geojson = None
+            dispatch.deviation_detected_at       = None
+            db.commit()
+            payload = _build_rerouted_payload(dispatch, selected, saved, "driver_location")
+        else:
+            connector = None
+            fire = db.get(FireIncident, dispatch.fire_id)
+            if fire and fire.fire_latitude is not None and fire.fire_longitude is not None:
+                # CPU-bound connector build — run in the process pool.
+                connector = _run_routing_via_pool(
+                    "connector", lat, lon, fire.fire_latitude, fire.fire_longitude, obs
+                )
+            dispatch.deviation_connector_geojson = connector
+            db.commit()
+            payload = {
+                "type": "dispatch_deviation",
+                "data": {
+                    "dispatch_id":           dispatch.dispatch_id,
+                    "per_id":                per_id,
+                    "is_deviated":           True,
+                    "connector_geojson":     connector,
+                    "deviation_detected_at": dispatch.deviation_detected_at.isoformat()
+                                             if dispatch.deviation_detected_at else None,
+                },
+            }
+    except Exception as exc:
+        logger.warning("Background deviation routing failed (dispatch=%s): %s", dispatch_id, exc)
+        db.rollback()
+        return
+    finally:
+        db.close()
+
+    if payload is not None:
+        _broadcast_threadsafe(payload)
+
+
 def _check_deviation(
     db: Session,
     dispatch: DispatchRecord,
     lat: float,
     lon: float,
+    compute_connector: bool = True,
 ) -> "tuple[bool, dict | None]":
     """
     Returns (is_deviated, connector_geojson | None).
     Uses PostGIS geography distance for metre-accurate checks.
     Buffer zone (50–280 m) preserves the existing deviation state.
+
+    When `compute_connector` is False, deviation is still detected (cheap
+    PostGIS distance) but the expensive connector routing is skipped — the
+    caller is expected to build it off the request thread.
     """
     if not dispatch.route_id:
         return False, None
@@ -2949,7 +3126,7 @@ def _check_deviation(
 
     if dist > DEVIATION_THRESHOLD_M:
         connector = None
-        if routing_engine:
+        if compute_connector and routing_engine:
             fire = db.get(FireIncident, dispatch.fire_id)
             if fire and fire.fire_latitude is not None and fire.fire_longitude is not None:
                 try:
@@ -3049,43 +3226,41 @@ def location_update(
 
         _sync_truck(db, dispatch, per_id, body.latitude, body.longitude, now)
 
-        is_deviated, connector = _check_deviation(db, dispatch, body.latitude, body.longitude)
+        # Cheap deviation DETECTION (PostGIS distance) stays inline; the
+        # EXPENSIVE routing a deviation triggers — a connector to the fire, or
+        # a full route rebuild if this person mans the truck — is deferred to a
+        # background task so the GNN/graph compute never blocks this request
+        # thread. The rebuilt route / connector reaches dashboards over WS and
+        # is reflected on the mobile side at the next status poll.
+        is_deviated, _ = _check_deviation(
+            db, dispatch, body.latitude, body.longitude, compute_connector=False
+        )
+        manning = is_deviated and _is_manning_truck(dispatch, per_id)
 
-        # If the deviating personnel is the one manning the truck, the truck
-        # itself is off route — rebuild the main route from their current
-        # position instead of just drawing a connector. If no one is manning
-        # the truck, a member wandering off only draws a connector.
-        driver_rebuild_done = False
-        if is_deviated and _is_manning_truck(dispatch, per_id):
-            rebuilt = _rebuild_routes(
-                db, dispatch, body.latitude, body.longitude, "driver_location"
-            )
-            if rebuilt is not None:
-                selected, saved = rebuilt
-                dispatch.is_deviated                 = False
-                dispatch.deviation_connector_geojson = None
-                dispatch.deviation_detected_at       = None
-                db.commit()
-                driver_rebuild_done = True
-                background_tasks.add_task(
-                    manager.broadcast,
-                    _build_rerouted_payload(dispatch, selected, saved, "driver_location"),
+        schedule_routing = False
+        if is_deviated and not dispatch.is_deviated:
+            dispatch.is_deviated           = True
+            dispatch.deviation_detected_at = now
+            db.commit()
+            schedule_routing = True
+        elif is_deviated and dispatch.is_deviated:
+            schedule_routing = True   # refresh connector / rebuild from new position
+        elif not is_deviated and dispatch.is_deviated:
+            dispatch.is_deviated                 = False
+            dispatch.deviation_connector_geojson = None
+            dispatch.deviation_detected_at       = None
+            db.commit()
+
+        if schedule_routing:
+            if _REROUTE_INLINE:
+                _recompute_deviation_routing_bg(
+                    dispatch.dispatch_id, per_id, body.latitude, body.longitude, manning
                 )
-
-        if not driver_rebuild_done:
-            if is_deviated and not dispatch.is_deviated:
-                dispatch.is_deviated                 = True
-                dispatch.deviation_detected_at       = now
-                dispatch.deviation_connector_geojson = connector
-                db.commit()
-            elif is_deviated and dispatch.is_deviated:
-                dispatch.deviation_connector_geojson = connector
-                db.commit()
-            elif not is_deviated and dispatch.is_deviated:
-                dispatch.is_deviated                 = False
-                dispatch.deviation_connector_geojson = None
-                dispatch.deviation_detected_at       = None
-                db.commit()
+            else:
+                background_tasks.add_task(
+                    _recompute_deviation_routing_bg,
+                    dispatch.dispatch_id, per_id, body.latitude, body.longitude, manning,
+                )
     else:
         db.commit()  # location_log only
 
