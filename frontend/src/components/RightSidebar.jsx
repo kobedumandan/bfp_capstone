@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import "../styles/RightSidebar.css";
 import DispatchModal from "./DispatchModal";
+import EscalateAlarmModal from "./EscalateAlarmModal";
 
 function TimeIcon() {
   return (
@@ -345,6 +346,7 @@ export default function RightSidebar({
     if (focusNonce > 0) setActiveTab("Incident");
   }, [focusNonce]);
   const [showDispatch, setShowDispatch] = useState(false);
+  const [showEscalate, setShowEscalate] = useState(false);
   const [rerouteConfirm, setRerouteConfirm] = useState(null); // dispatch_id awaiting confirm
   const [rerouteLoading, setRerouteLoading] = useState(false);
 
@@ -782,7 +784,18 @@ export default function RightSidebar({
             >
               Dispatch Unit
             </button>
-            <button className="btn-secondary">Escalate Alarm</button>
+            <button
+              className="btn-secondary"
+              onClick={() => setShowEscalate(true)}
+              disabled={(incident.alarm || "1st Alarm") === "3rd Alarm"}
+              title={
+                (incident.alarm || "1st Alarm") === "3rd Alarm"
+                  ? "Already at the highest alarm level"
+                  : "Raise the alarm level and dispatch more units"
+              }
+            >
+              Escalate Alarm
+            </button>
           </div>
         )}
       </div>
@@ -795,6 +808,14 @@ export default function RightSidebar({
             setShowDispatch(false);
             onDispatched?.(result);
           }}
+        />
+      )}
+
+      {showEscalate && incident && (
+        <EscalateAlarmModal
+          incident={incident}
+          onClose={() => setShowEscalate(false)}
+          onDispatched={(result) => onDispatched?.(result)}
         />
       )}
     </>

@@ -323,6 +323,21 @@ export async function createDispatch(body) {
   return res.json()
 }
 
+// Ranked shortlist of teams to send when escalating an incident's alarm level.
+// Read-only — it never dispatches. `targetLevel` is the alarm level being
+// escalated to, which drives `target_units` in the response.
+export async function fetchDispatchRecommendations(fireId, { limit = 8, targetLevel } = {}) {
+  const params = new URLSearchParams()
+  params.set('limit', limit)
+  if (targetLevel) params.set('target_level', targetLevel)
+  const res = await apiFetch(`/api/incidents/${fireId}/dispatch-recommendations?${params}`)
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || `Failed to fetch dispatch recommendations (${res.status})`)
+  }
+  return res.json()
+}
+
 export async function fetchPersonnelLocations() {
   const res = await apiFetch('/api/personnel/locations')
   if (!res.ok) throw new Error(`Failed to fetch personnel locations (${res.status})`)

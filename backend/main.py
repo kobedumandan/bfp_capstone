@@ -30,7 +30,7 @@ from models import (
     BarangayBoundary, Device, IncidentReport, ReportPhoto,
 )
 from ai import GeoAIRoutingEngine, Config
-from auto_dispatch import select_best_team
+from auto_dispatch import select_best_team, recommend_teams, ALARM_UNIT_TARGETS
 from routing_setup import build_routing_engine
 from coverage_engine import compute_coverage
 import routing_pool
@@ -485,6 +485,10 @@ def gnn_constraints(db: Session = Depends(get_db)):
             "legend": legend,
         },
     }
+    _gnn_constraints_cache = result
+    return result
+
+
 # ── Custom GNN constraints (user-drawn) ──────────────────────────────────────
 
 VALID_CONSTRAINT_TYPES = ("narrow_road", "traffic_area")
@@ -2475,6 +2479,71 @@ async def create_dispatch(
     _auth: Users = Depends(get_current_user),
 ):
     return await _perform_dispatch(db, body.fire_id, body.team_id)
+
+
+@app.get("/api/incidents/{fire_id}/dispatch-recommendations")
+def get_dispatch_recommendations(
+    fire_id: int,
+    limit: int = 8,
+    target_level: str | None = None,
+    db: Session = Depends(get_db),
+    _auth: Users = Depends(get_current_user),
+):
+    """Ranked shortlist of teams to send for an alarm escalation.
+
+    Read-only: it never dispatches. The escalate-alarm flow shows this list so a
+    dispatcher can review and confirm which additional units go. Teams already
+    actively dispatched to this incident are excluded so they aren't re-offered.
+
+    `target_level` (the alarm level being escalated to) drives `target_units` in
+    the response — the total number of units that level warrants — so the client
+    can compute how many *more* to dispatch (target minus already active).
+    """
+    incident = db.get(FireIncident, fire_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found.")
+
+    active = (
+        db.query(DispatchRecord)
+        .filter(
+            DispatchRecord.fire_id == fire_id,
+            DispatchRecord.dispatch_status.in_(["dispatched", "en_route", "on_scene"]),
+        )
+        .all()
+    )
+    exclude_ids = [d.team_id for d in active]
+
+    recommended, reason, _meta = recommend_teams(
+        db, incident,
+        routing_engine=routing_engine,
+        limit=max(1, min(limit, 25)),
+        exclude_team_ids=exclude_ids,
+    )
+
+    target_units = ALARM_UNIT_TARGETS.get(target_level) if target_level else None
+
+    return {
+        "fire_id":          fire_id,
+        "target_level":     target_level,
+        "target_units":     target_units,
+        "already_active":   len(active),
+        "excluded_team_ids": exclude_ids,
+        "recommended": [
+            {
+                "team_id":      c["team_id"],
+                "team_name":    c["team_name"],
+                "station_id":   c["station_id"],
+                "station_name": c.get("station_name"),
+                "eta_seconds":  c["eta_seconds"],
+                "eta_minutes":  round(c["eta_seconds"] / 60, 2),
+                "eta_source":   c["eta_source"],
+                "haversine_m":  c["haversine_m"],
+            }
+            for c in recommended
+        ],
+        "available_count": len(recommended),
+        "reason":          reason,   # non-null when nothing eligible remains
+    }
 
 
 @app.get("/api/dispatch")
