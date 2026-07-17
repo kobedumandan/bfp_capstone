@@ -149,14 +149,46 @@ def _route_eta_seconds(routing_engine, origin_lat: float, origin_lng: float,
         return None
 
 
-def select_best_team(db: Session, incident: FireIncident, routing_engine=None) -> SelectionResult:
+# ── Alarm-level → target unit count ───────────────────────────────────────────
+# BFP alarm levels map to how many responding units the incident warrants. Used
+# by the "escalate alarm" flow to decide how many teams to recommend. Ordered so
+# the frontend/backend agree on what "the next level up" means.
+ALARM_LEVELS = ["1st Alarm", "2nd Alarm", "3rd Alarm", "General Alarm"]
+ALARM_UNIT_TARGETS: dict[str, int] = {
+    "1st Alarm":     1,
+    "2nd Alarm":     2,
+    "3rd Alarm":     3,
+    "General Alarm": 99,   # effectively "all available units"
+}
+
+
+def _rank_teams(
+    db: Session,
+    incident: FireIncident,
+    routing_engine=None,
+    exclude_team_ids: set[int] | list[int] | None = None,
+    top_n: int = HAVERSINE_TOP_N,
+) -> tuple[list[dict[str, Any]], str | None, dict[str, Any]]:
+    """Core ranking pipeline shared by single- and multi-team selection.
+
+    Returns (scored, reason, meta):
+      * scored  – candidate dicts sorted ascending by score (best first). Empty
+                  when no team is eligible.
+      * reason  – None on success; otherwise a diagnostic reason code.
+      * meta    – {"shift_id", "stage_counts"} for diagnostics.
+    """
     if incident.fire_latitude is None or incident.fire_longitude is None:
-        return SelectionResult(ok=False, reason="incident_missing_coordinates")
+        return [], "incident_missing_coordinates", {"shift_id": None, "stage_counts": {}}
 
     now = datetime.now(timezone.utc)
     shift_id = current_shift_id(db, now)
 
     eligible, stage_counts = _eligible_teams(db, shift_id)
+    exclude = set(exclude_team_ids or ())
+    if exclude:
+        eligible = [t for t in eligible if t.team_id not in exclude]
+
+    meta = {"shift_id": shift_id, "stage_counts": stage_counts}
     if not eligible:
         # Pick the most informative reason based on where the funnel collapsed.
         if stage_counts["total"] == 0:
@@ -169,11 +201,7 @@ def select_best_team(db: Session, incident: FireIncident, routing_engine=None) -
             reason = "no_available_truck"
         else:
             reason = "no_team_on_standby"
-        return SelectionResult(
-            ok=False,
-            reason=reason,
-            breakdown={"shift_id": shift_id, "eligible_count": 0, "stage_counts": stage_counts},
-        )
+        return [], reason, meta
 
     # Stage B: haversine prefilter.
     with_distance = [
@@ -187,7 +215,7 @@ def select_best_team(db: Session, incident: FireIncident, routing_engine=None) -
         for t in eligible
     ]
     with_distance.sort(key=lambda x: x[1])
-    finalists = with_distance[:HAVERSINE_TOP_N]
+    finalists = with_distance[:top_n]
 
     # Stages C + D + E: real ETA + workload tiebreaker -> final score.
     scored: list[dict[str, Any]] = []
@@ -205,23 +233,60 @@ def select_best_team(db: Session, incident: FireIncident, routing_engine=None) -
         workload = _recent_dispatch_count(db, team.team_id, now)
         score = eta + workload * WORKLOAD_PENALTY_SEC
         scored.append({
-            "team_id":     team.team_id,
-            "team_name":   team.team_name,
-            "station_id":  team.station_id,
-            "haversine_m": round(hav_m, 1),
-            "eta_seconds": round(eta, 1),
-            "eta_source":  eta_source,
-            "workload":    workload,
-            "score":       round(score, 1),
+            "team_id":      team.team_id,
+            "team_name":    team.team_name,
+            "station_id":   team.station_id,
+            "station_name": team.station.station_name if team.station else None,
+            "haversine_m":  round(hav_m, 1),
+            "eta_seconds":  round(eta, 1),
+            "eta_source":   eta_source,
+            "workload":     workload,
+            "score":        round(score, 1),
         })
 
     scored.sort(key=lambda r: r["score"])
-    winner = scored[0]
+    return scored, None, meta
 
+
+def select_best_team(db: Session, incident: FireIncident, routing_engine=None) -> SelectionResult:
+    scored, reason, meta = _rank_teams(db, incident, routing_engine)
+    if reason is not None:
+        return SelectionResult(
+            ok=False,
+            reason=reason,
+            breakdown={
+                "shift_id":       meta.get("shift_id"),
+                "eligible_count": 0,
+                "stage_counts":   meta.get("stage_counts"),
+            },
+        )
+
+    winner = scored[0]
     return SelectionResult(
         ok=True,
         team_id=winner["team_id"],
         station_id=winner["station_id"],
         eta_seconds=winner["eta_seconds"],
-        breakdown={"shift_id": shift_id, "candidates": scored},
+        breakdown={"shift_id": meta.get("shift_id"), "candidates": scored},
     )
+
+
+def recommend_teams(
+    db: Session,
+    incident: FireIncident,
+    routing_engine=None,
+    limit: int = 8,
+    exclude_team_ids: set[int] | list[int] | None = None,
+) -> tuple[list[dict[str, Any]], str | None, dict[str, Any]]:
+    """Return up to `limit` ranked candidate teams for the escalate-alarm flow.
+
+    Unlike select_best_team (which returns just the winner), this returns the
+    full ranked shortlist so a dispatcher can review and confirm which units go.
+    `exclude_team_ids` should hold teams already dispatched to this incident.
+    """
+    scored, reason, meta = _rank_teams(
+        db, incident, routing_engine,
+        exclude_team_ids=exclude_team_ids,
+        top_n=max(HAVERSINE_TOP_N, limit),
+    )
+    return scored[:limit], reason, meta
